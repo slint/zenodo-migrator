@@ -36,6 +36,7 @@ import click
 from celery.task.control import inspect
 from flask.cli import with_appcontext
 from invenio_db import db
+from invenio_files_rest.models import FileInstance
 from invenio_github.api import GitHubAPI
 from invenio_github.models import Repository
 from invenio_indexer.api import RecordIndexer
@@ -47,6 +48,7 @@ from invenio_pidstore.models import PersistentIdentifier, PIDStatus
 from invenio_records.api import Record
 from invenio_records.models import RecordMetadata
 from invenio_sipstore.models import SIP
+from invenio_xrootd.storage import XRootDFileStorage
 from lxml import etree
 from six import StringIO
 from sqlalchemy import type_coerce
@@ -778,3 +780,49 @@ def load_sipfiles_dump(source):
         for sf in sipfiles_dump_b:
             file_id, filepath, sip_id, created, _ = sf
             load_sipfile.s(file_id, filepath, sip_id, created).apply_async()
+
+
+@migration.command()
+@click.argument('errors', type=click.File('w'))
+@click.option('-n', '--dry-run', is_flag=True)
+@click.option('-v', '--verbose', is_flag=True)
+@with_appcontext
+def migrate_files_afs_to_eos(errors, dry_run, verbose):
+    """Migrate already transferred AFS files to EOS."""
+    failed_files = []
+    afs_prefix = '/opt/zenodo/var/data/'
+    eos_prefix = 'root://eospublic.cern.ch//eos/zenodo/prod/legacydata/'
+    afs_files = FileInstance.query.filter(
+        FileInstance.uri.startswith(afs_prefix))
+    for f in afs_files:
+        try:
+            # First do a checksum validation
+            new_uri = f.uri.replace(afs_prefix, eos_prefix)
+            old_checksum = f.checksum
+            new_checksum = XRootDFileStorage(new_uri).checksum()
+            if old_checksum == new_checksum:
+                if not dry_run:
+                    # All good, update the URI
+                    f.uri = new_uri
+                    f.verify_checksum()
+                    db.session.add(f)
+                    db.session.commit()
+                if verbose:
+                    click.secho(
+                        u'OK {f.id} {f.uri} -> {new_uri}'
+                        .format(f=f, new_uri=new_uri),
+                        fg='green')
+            else:
+                failed_files.append((str(f.id), f.uri, new_uri))
+                click.secho(
+                    u'Checksum mismatch at {f.id} {f.uri} -> {new_uri}'
+                    .format(f=f, new_uri=new_uri),
+                    fg='red')
+        except Exception as ex:
+            failed_files.append((str(f.id), f.uri, new_uri))
+            click.secho(
+                u'Error at [{f.id}] {f.uri} -> {new_uri} {ex}'
+                .format(f=f, new_uri=new_uri, ex=ex),
+                fg='red')
+    # Write failed files to JSON
+    json.dump(failed_files, errors, indent=2)
